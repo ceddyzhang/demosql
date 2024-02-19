@@ -1,0 +1,57 @@
+create or replace view TWIN_US_PROD.TWIN_DW.V_BI_MEMBER_DAILY_PREDICTION_ELIGIBILITY
+as
+select targetmembers.member_id, targetmembers.event_date, targetmembers.eligible_for_pbg
+	, targetmembers.relapse_or_return_to_cgm_early, targetmembers.food_logged, targetmembers.activity_tracker, targetmembers.scale_synced
+	, iff(cycles.cycle_start_date is null,FALSE,TRUE) as member_is_on_cycle, cycles.cycle_type, cycles.cycle_start_date, cycles.cycle_end_date, cycles.cycle_duration, cycles.is_earliest_cycle_of_member, earlist_eligible_date_for_this_cycle, days_to_transition_to_this_cycle
+from 
+	( 
+		//what each member is doing on each day 
+		select clientid as member_id, date(eventdate) as event_date, to_boolean(gobacktocgm) as gobacktocgm
+			, to_boolean(gobacktopbg) as gobacktopbg, to_boolean(pbgrelapse) as relapse_or_return_to_cgm_early
+			, to_boolean(eligibleforpbg) as eligible_for_pbg, to_boolean(pbgprovisioned) as pbg_provisioned
+			, to_boolean(activitytracker) as activity_tracker, to_boolean(scalesynced) as scale_synced
+			, to_boolean(fullyormetforminreversed) as fully_or_metformin_reversed, to_boolean(foodlogged) as food_logged, onprogramforsufficientdays
+			, deleted, __deleted 
+		from TWIN_US_STAGE.TWINS.PBGSTATUSINDICATORS 
+		where (__deleted is null or __deleted = false) AND (DELETED is null or DELETED = false) 
+		order by clientId ,eventDate 
+	) as targetmembers
+left join 
+	(
+		select predictioncycles.clientid, predictioncycles.cycle_start_date, predictioncycles.cycle_end_date
+			, predictioncycles.cycle_type, predictioncycles.cycle_duration, predictioncycles.previous_cycle_start_date
+			, predictioncycles.previous_cycle_end_date, predictioncycles.member_earliest_cycle_start_date, predictioncycles.member_earliest_cycle_end_date
+			, predictioncycles.cycle_start_date = predictioncycles.member_earliest_cycle_start_date as is_earliest_cycle_of_member
+			, min(eligibilitybeforecycles.eventdate) as earlist_eligible_date_for_this_cycle
+			, datediff('day',earlist_eligible_date_for_this_cycle,predictioncycles.cycle_start_date) as days_to_transition_to_this_cycle 
+		from 	
+			( 		
+				select 			
+					clientId,--predictedCGMCycleId
+					,startDate as cycle_start_date,	endDate as cycle_end_date, cycle_type
+					, datediff('day',startdate,enddate) as cycle_duration
+					,lag(startdate,1) over(partition by clientid order by clientid,startdate) as previous_cycle_start_date
+					, lag(enddate,1) over(partition by clientid order by clientid,startdate) as previous_cycle_end_date
+					, min(startdate) over(partition by clientid order by clientid) as member_earliest_cycle_start_date
+					, min(enddate) over(partition by clientid order by clientid) as member_earliest_cycle_end_date, __deleted 		
+				from 
+					(
+					//replace with just table name once engineering change is ready 
+						select clientId,startDate,endDate, type as cycle_type,__deleted 
+						from TWIN_US_STAGE.TWINS.PREDICTEDCGMCYCLES 
+						//Only look at data after this date this because prior data from legacy prediction system 
+						where startdate >= '2023-07-01' 
+					) 
+				where (__deleted is null or __deleted = false) 
+				order by clientId,cycle_start_date 	
+			) as predictioncycles 
+		left join 	
+			(
+				select clientId,eventDate,eligibleForPbg, __deleted 		
+				from TWIN_US_STAGE.TWINS.PBGSTATUSINDICATORS 		
+				where (__deleted is null or __deleted = false) AND (DELETED is null or DELETED = false) 			
+				and eligibleforpbg = true 		
+					order by clientId ,eventDate 	
+			) as eligibilitybeforecycles on predictioncycles.clientid = eligibilitybeforecycles.clientid and predictioncycles.cycle_start_date >= eligibilitybeforecycles.eventdate and iff(predictioncycles.previous_cycle_end_date is null, true, predictioncycles.previous_cycle_end_date < eligibilitybeforecycles.eventdate) --where predictioncycles.clientid = 449002 
+		group by predictioncycles.clientid, predictioncycles.cycle_start_date, predictioncycles.cycle_end_date, predictioncycles.cycle_type, predictioncycles.cycle_duration, predictioncycles.previous_cycle_start_date, predictioncycles.previous_cycle_end_date, predictioncycles.member_earliest_cycle_start_date, predictioncycles.member_earliest_cycle_end_date, is_earliest_cycle_of_member order by predictioncycles.clientid,predictioncycles.cycle_start_date 
+	) as cycles on targetmembers.member_id = cycles.clientid and targetmembers.event_date >= cycles.cycle_start_date and targetmembers.event_date <= cycles.cycle_end_dateorder by targetmembers.member_id, targetmembers.event_date
